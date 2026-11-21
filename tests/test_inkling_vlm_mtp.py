@@ -587,6 +587,32 @@ def test_inkling2_loop_controller_ignores_prefill_chunking():
         assert mx.array_equal(part, full[:, :, :1000])
 
 
+def test_inkling2_loop_controller_fused_kernel_matches_mlx_path():
+    from omlx.patches.inkling2 import kernels
+    from omlx.patches.inkling2.model import _mix_messages
+
+    hidden, rank = 2304, 64
+    if not kernels.mix_messages_fits(1, hidden, rank):
+        pytest.skip("fused loop controller kernel needs the GPU")
+    mx.random.seed(3)
+    down = mx.random.normal((4, 2, hidden, rank)) * 0.02
+    gates = mx.random.normal((4, rank, 2 * hidden)) * 0.1
+    for n, first in ((3, 0), (1, 3)):
+        for rows in (1, 8):
+            x = mx.random.normal((n, 1, rows, hidden))
+            msg = mx.random.normal((n, 1, rows, hidden))
+            ref = _mix_messages(
+                x, msg, down[first : first + n], gates[first : first + n]
+            )
+            got = kernels.mix_messages_small(x, msg, down, gates, first)
+            # Only the FP32 summation order differs. A low-rank value that
+            # lands next to a BF16 rounding boundary may round the other way,
+            # which moves its row slightly; everything else agrees closely.
+            diff = mx.abs(got - ref).max(axis=-1)
+            assert mx.mean(diff < 1e-5).item() >= 0.75
+            assert diff.max().item() < 0.05
+
+
 def test_inkling2_loop_model_type_uses_inkling2(tmp_path):
     from mlx_lm.utils import _get_classes
 
