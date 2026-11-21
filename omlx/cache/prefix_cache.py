@@ -2139,22 +2139,39 @@ class BlockAwarePrefixCache(CacheManager):
             return max_seq_len
 
         # Step 3: CacheList fallback — check sub-states for seq_len
-        # This handles all-CacheList models (e.g., deepseek_v32)
+        # This handles all-CacheList models (e.g., deepseek_v32). A
+        # sliding-window member (e.g. Inkling 2's sliding layers) holds only
+        # its window, so prefer a full-history member from any layer; the
+        # window length is only the last resort.
+        window_seq_len = 0
         for layer_state in cache_data:
             if (
                 layer_state.get("cache_type") == "CacheList"
                 or layer_state.get("class_name") == "CacheList"
             ):
                 sub_states = layer_state.get("state", [])
-                for sub_state in sub_states:
+                sub_names: list[Any] = []
+                meta = layer_state.get("meta_state")
+                if isinstance(meta, (list, tuple)) and meta:
+                    if isinstance(meta[0], (list, tuple)):
+                        sub_names = list(meta[0])
+                for sub_idx, sub_state in enumerate(sub_states):
                     if isinstance(sub_state, (list, tuple)) and len(sub_state) >= 2:
                         sub_keys = sub_state[0]
                         if hasattr(sub_keys, "shape") and len(sub_keys.shape) == 4:
                             seq_len = sub_keys.shape[2]
+                            sub_name = (
+                                sub_names[sub_idx] if sub_idx < len(sub_names) else ""
+                            )
+                            if isinstance(
+                                sub_name, str
+                            ) and CacheTypeRegistry.is_rotating_family(sub_name):
+                                window_seq_len = max(window_seq_len, seq_len)
+                                continue
                             logger.debug(f"Using CacheList sub-cache seq_len={seq_len}")
                             return seq_len
 
-        return 0
+        return window_seq_len
 
     def _discard_tail_block(
         self,

@@ -242,3 +242,59 @@ def test_buffer_shrinks_when_decode_follows_a_long_chunk():
         cache.update_and_fetch(one, one)
     assert cache.offset == 8192 + 51
     assert cache._idx >= 1024 - 1 + cache.slack
+
+
+def test_scheduler_snapshot_of_window_member_is_canonical_rotating(
+    mock_model, mock_tokenizer
+):
+    """Prefix/SSD extraction stores the latest max_size rows, and the
+    restored rotating cache adopts back into an identical window."""
+    from omlx.cache.type_handlers import RotatingKVCacheHandler
+    from omlx.scheduler import Scheduler
+
+    window = 64
+    full, live = KVCache(), Inkling2WindowKVCache(window)
+    for seed, n in enumerate([300, 300, 1, 77]):
+        a = _qkv(n, seed=40 + seed, r=window)
+        _attend(full, *a, window)
+        _attend(live, *a, window)
+    assert live.start_position > 0
+
+    scheduler = Scheduler(model=mock_model, tokenizer=mock_tokenizer)
+    extracted, _ = scheduler._extract_cache_states([CacheList(live, ArraysCache(4))])
+    sub_names, sub_meta = extracted[0]["meta_state"]
+    keys, values = extracted[0]["state"][0]
+    assert sub_names[0] == "Inkling2WindowKVCache"
+    assert tuple(sub_meta[0]) == ("0", str(window), str(live.offset), str(window))
+    assert keys.shape[2] == window
+
+    restored = RotatingKVCacheHandler().reconstruct_cache(
+        {"keys": keys, "values": values}, tuple(sub_meta[0])
+    )
+    entry = CacheList(restored, ArraysCache(4))
+    adopt(entry)
+    for seed in range(5):
+        a = _qkv(1 if seed % 2 else 8, seed=60 + seed, r=window)
+        assert mx.array_equal(_attend(full, *a, window), _attend(entry[0], *a, window))
+
+
+def test_prefix_store_reads_sequence_length_from_full_member():
+    """The store slices new blocks by the full-history length; a sliding
+    member in the first layer must not be mistaken for it (that saved new
+    blocks' full-attention KV shifted by the restored prefix)."""
+    from omlx.cache.prefix_cache import BlockAwarePrefixCache
+
+    def layer(name, rows):
+        kv = mx.zeros((1, HKV, rows, D))
+        conv = (mx.zeros((1, 3, 8)),) * 4
+        return {
+            "class_name": "CacheList",
+            "cache_type": "CacheList",
+            "state": [(kv, kv), conv],
+            "meta_state": ([name, "ArraysCache"], [(), ()]),
+        }
+
+    data = [layer("Inkling2WindowKVCache", 1024), layer("KVCache", 32792)]
+    assert BlockAwarePrefixCache._get_cache_seq_len(None, data) == 32792
+    only_windows = [layer("Inkling2WindowKVCache", 1024)]
+    assert BlockAwarePrefixCache._get_cache_seq_len(None, only_windows) == 1024
