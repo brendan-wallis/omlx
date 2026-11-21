@@ -108,7 +108,7 @@ private struct ProjectSection: View {
                                  defaultValue: "Download the latest CLI and macOS app",
                                  comment: "Sublabel under the Releases link on the About screen"),
                 icon: "shippingbox",
-                url: URL(string: "https://github.com/jundot/omlx/releases")!
+                url: URL(string: "https://github.com/brendan-wallis/omlx/releases")!
             )
             LinkRow(
                 label: String(localized: "about.project.docs.label",
