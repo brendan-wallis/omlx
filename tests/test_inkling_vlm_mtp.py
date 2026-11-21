@@ -613,6 +613,49 @@ def test_inkling2_loop_controller_fused_kernel_matches_mlx_path():
             assert diff.max().item() < 0.05
 
 
+def test_inkling2_static_conv_kernel_matches_mlx_path(monkeypatch):
+    from omlx.patches.inkling2 import kernels
+    from omlx.patches.inkling2 import model as inkling2
+
+    if mx.default_device() != mx.gpu:
+        pytest.skip("fused static conv kernel needs the GPU")
+    monkeypatch.setattr(inkling2, "_COMPILED_MAX_TOKENS", 0)
+    for wdtype in (mx.bfloat16, mx.float32):
+        for length in (1, 2, 16):
+            x = mx.random.normal((1, length, 2304)).astype(mx.bfloat16)
+            w = (mx.random.normal((2304, 4)) * 0.3).astype(wdtype)
+            state = mx.random.normal((1, 3, 2304))
+            ref = inkling2._static_conv(x, w, state, 0.447)
+            got = kernels.static_conv_small(x, w, state, 0.447)
+            assert mx.array_equal(got[0], ref[0])
+            assert mx.array_equal(got[1], ref[1])
+
+
+def test_inkling2_verify_attention_kernel_matches_masked_path():
+    from omlx.patches.inkling2 import kernels
+
+    hq, hkv, d, rel_extent = 24, 8, 128, 1024
+    mx.random.seed(0)
+    q = mx.zeros((1, hq, 2, d), dtype=mx.bfloat16)
+    k = mx.zeros((1, hkv, 8, d), dtype=mx.bfloat16)
+    if not kernels.verify_attention_fits(q, k, None):
+        pytest.skip("verify attention kernel needs the GPU")
+    for window, keys, length in ((1024, 1500, 8), (1024, 300, 3), (0, 3000, 8), (0, 40, 16)):
+        q = (mx.random.normal((1, hq, length, d)) * 0.3).astype(mx.bfloat16)
+        # K/V as a cache hands them out: a prefix view of a larger buffer.
+        kbuf = (mx.random.normal((1, hkv, keys + 64, d)) * 0.3).astype(mx.bfloat16)
+        vbuf = mx.random.normal((1, hkv, keys + 64, d)).astype(mx.bfloat16)
+        k, v = kbuf[:, :, :keys], vbuf[:, :, :keys]
+        rel = mx.random.normal((1, length, hq, rel_extent)).astype(mx.bfloat16)
+        sink = (mx.random.normal((1, length, hq)) * 2).astype(mx.bfloat16)
+        ref = kernels._masked_attention(q, k, v, rel, sink, 0.088, window, None)
+        got = kernels.verify_attention(q, k, v, rel, sink, scale=0.088, window=window)
+        assert got.shape == ref.shape
+        # BF16 outputs below 0.5: one rounding step is at most ~0.002.
+        err = mx.abs(got.astype(mx.float32) - ref.astype(mx.float32)).max().item()
+        assert err <= 2e-3
+
+
 def test_inkling2_loop_model_type_uses_inkling2(tmp_path):
     from mlx_lm.utils import _get_classes
 

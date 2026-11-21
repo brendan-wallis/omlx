@@ -372,6 +372,8 @@ def _static_conv(x, w, state, scale):
     Returns the output and the padded input window ``[state, x]``; its last
     ``K - 1`` rows are the next state.
     """
+    if x.shape[1] <= _COMPILED_MAX_TOKENS and mx.default_device() == mx.gpu:
+        return kernels.static_conv_small(x, w, state, scale)
     xf = x.astype(mx.float32)
     k = w.shape[-1]
     xp = mx.concatenate([state, xf], axis=1)
