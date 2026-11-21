@@ -609,6 +609,26 @@ class Inkling2Layer(nn.Module):
         self._pre_compiled = mx.compile(lambda *a: Inkling2Layer._pre(layer, *a))
         self._post_compiled = mx.compile(lambda *a: Inkling2Layer._post(layer, *a))
 
+    def _mix(self, x, message, first):
+        """Loop controllers ``first .. first + len(x)`` (see ``_mix_messages``).
+
+        Decode and verify rows take the fused kernels; prefill chunks keep the
+        MLX path, whose result does not depend on how a prompt is chunked.
+        """
+        n, b, length, hidden = x.shape
+        if length <= _COMPILED_MAX_TOKENS and kernels.mix_messages_fits(
+            b * length, hidden, self.loop_down.shape[-1]
+        ):
+            return kernels.mix_messages_small(
+                x, message, self.loop_down, self.loop_gain_forget, first
+            )
+        return _mix_messages(
+            x,
+            message,
+            self.loop_down[first : first + n],
+            self.loop_gain_forget[first : first + n],
+        )
+
     def _pre(self, h, blocks, ks, vs, tau=None, messages=None):
         dtype = h.dtype
         h_n = _unit_rms(h.astype(mx.float32))
@@ -621,11 +641,8 @@ class Inkling2Layer(nn.Module):
             else:
                 xq, xk, xv = mixed[:, :, 0], mixed[:, :, 1], mixed[:, :, 2]
         if messages is not None:
-            xq, xk, xv = _mix_messages(
-                mx.stack([xq, xk, xv]),
-                messages[:, :, :3].transpose(2, 0, 1, 3),
-                self.loop_down[:3],
-                self.loop_gain_forget[:3],
+            xq, xk, xv = self._mix(
+                mx.stack([xq, xk, xv]), messages[:, :, :3].transpose(2, 0, 1, 3), 0
             )
         if self.sliding and messages is None:
             xq = self.attn_norm(xq).astype(dtype)
@@ -647,12 +664,7 @@ class Inkling2Layer(nn.Module):
             residual = h.astype(mx.float32) + a.astype(mx.float32)
         y = self.mlp_input(mlp_blocks, _unit_rms(residual))[:, :, 0]
         if messages is not None:
-            y = _mix_messages(
-                y[None],
-                messages[None, :, :, 3],
-                self.loop_down[3:],
-                self.loop_gain_forget[3:],
-            )[0]
+            y = self._mix(y[None], messages[None, :, :, 3], 3)[0]
         m = self.mlp(self.mlp_norm(y).astype(h.dtype))
         m, s3 = _static_conv(m, self.mlp_conv, s3, self._conv_scale)
         return (residual + m.astype(mx.float32)).astype(h.dtype), s2, s3

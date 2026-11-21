@@ -542,3 +542,163 @@ def route_topk(logits: mx.array, bias: mx.array, top_k: int, route_scale: float)
         output_dtypes=[mx.uint32, mx.float32],
     )
     return inds, weights
+
+
+# Loop controllers at decode and verify sizes. The MLX path runs about ten
+# dependent small kernels per call (two RMS norms, a stack, casts, two batched
+# matmuls, a reduction and the gate); every looped layer visit calls it twice,
+# so on the critical path of a decode step it costs more in kernel latency
+# than in work. Two kernels do the same: the first splits the low-rank down
+# projection over threadgroups, the second finishes it and applies the gates.
+_MIX_SPLITS = 32
+_MIX_TG = 256
+_MIX_MAX_ROWS = 16
+
+_MIX_DOWN_SOURCE = """
+    constexpr uint NSG = TG / 32;
+    constexpr uint PARTS = TG / R;
+    constexpr uint CH = (2 * H) / S;
+    const uint tid = thread_position_in_threadgroup.x;
+    const uint s = threadgroup_position_in_grid.x;
+    const uint row = threadgroup_position_in_grid.y;
+    const uint n = threadgroup_position_in_grid.z;
+    const uint rows = threadgroups_per_grid.y;
+    const uint lane = tid % 32;
+    const uint sg = tid / 32;
+    const size_t base = ((size_t)n * rows + row) * H;
+
+    // Unit RMS of both inputs, as mx.fast.rms_norm computes it.
+    float sx = 0.0f, sm = 0.0f;
+    for (uint h = tid; h < H; h += TG) {
+        float a = x[base + h];
+        float b = m[base + h];
+        sx += a * a;
+        sm += b * b;
+    }
+    threadgroup float red[2][NSG];
+    sx = simd_sum(sx);
+    sm = simd_sum(sm);
+    if (lane == 0) {
+        red[0][sg] = sx;
+        red[1][sg] = sm;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float tx = 0.0f, tm = 0.0f;
+    for (uint i = 0; i < NSG; ++i) {
+        tx += red[0][i];
+        tm += red[1][i];
+    }
+    const float ix = metal::precise::rsqrt(tx / H + 1e-6f);
+    const float im = metal::precise::rsqrt(tm / H + 1e-6f);
+
+    // This threadgroup's slice of the [x | message] row times down [2H, R].
+    const uint j = tid % R;
+    const uint part = tid / R;
+    const device float* dn = down + ((size_t)(N0 + n) * 2 * H) * R;
+    float acc = 0.0f;
+    for (uint e = s * CH + part; e < (s + 1) * CH; e += PARTS) {
+        float z = e < H ? x[base + e] * ix : m[base + e - H] * im;
+        z = float(bfloat(z));
+        acc += z * dn[(size_t)e * R + j];
+    }
+    threadgroup float accs[PARTS][R];
+    accs[part][j] = acc;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid < R) {
+        float t = 0.0f;
+        for (uint p = 0; p < PARTS; ++p) t += accs[p][tid];
+        partial[(((size_t)n * rows + row) * S + s) * R + tid] = t;
+    }
+"""
+
+_MIX_GATE_SOURCE = """
+    const uint tid = thread_position_in_threadgroup.x;
+    const uint c = thread_position_in_grid.x;
+    const uint row = thread_position_in_grid.y;
+    const uint n = thread_position_in_grid.z;
+    const uint rows = threads_per_grid.y;
+    threadgroup float low[R];
+    for (uint j = tid; j < R; j += TG) {
+        float t = 0.0f;
+        const size_t pb = (((size_t)n * rows + row) * S) * R + j;
+        for (uint s = 0; s < S; ++s) t += partial[pb + (size_t)s * R];
+        low[j] = float(bfloat(t));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (c >= H) return;
+    const device float* g = gain_forget + (size_t)(N0 + n) * R * 2 * H;
+    float gain = 0.0f, forget = 0.0f;
+    for (uint j = 0; j < R; ++j) {
+        gain += low[j] * g[(size_t)j * 2 * H + c];
+        forget += low[j] * g[(size_t)j * 2 * H + H + c];
+    }
+    const size_t i = ((size_t)n * rows + row) * H + c;
+    out[i] = (1.0f - metal::precise::tanh(forget)) * x[i]
+        + metal::precise::tanh(gain) * m[i];
+"""
+_mix_down_kernel = None
+_mix_gate_kernel = None
+
+
+def mix_messages_fits(rows: int, hidden: int, rank: int) -> bool:
+    """Whether ``mix_messages_small`` takes these shapes on this device."""
+    return (
+        rows <= _MIX_MAX_ROWS
+        and mx.default_device() == mx.gpu
+        and _MIX_TG % rank == 0
+        and (2 * hidden) % _MIX_SPLITS == 0
+    )
+
+
+def mix_messages_small(x, message, down, gain_forget, first: int):
+    """Loop controller update for a few rows.
+
+    ``x`` and ``message`` are [N, B, L, H] FP32; ``down`` is the layer's full
+    [4, 2, H, r] FP32 bank and ``gain_forget`` its [4, r, 2H] bank, of which
+    controllers ``first .. first + N`` are used. Same math as the MLX path in
+    ``model._mix_messages``: BF16-rounded unit-RMS inputs, FP32 accumulation
+    of the down projection, one BF16 rounding of the low-rank state.
+    """
+    global _mix_down_kernel, _mix_gate_kernel
+    if _mix_down_kernel is None:
+        _mix_down_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_mix_down",
+            input_names=["x", "m", "down"],
+            output_names=["partial"],
+            source=_MIX_DOWN_SOURCE,
+        )
+        _mix_gate_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_mix_gate",
+            input_names=["partial", "x", "m", "gain_forget"],
+            output_names=["out"],
+            source=_MIX_GATE_SOURCE,
+        )
+    n, b, length, hidden = x.shape
+    rows = b * length
+    rank = down.shape[-1]
+    x = x.astype(mx.float32)
+    message = message.astype(mx.float32)
+    tmpl = [
+        ("H", hidden),
+        ("R", rank),
+        ("S", _MIX_SPLITS),
+        ("TG", _MIX_TG),
+        ("N0", int(first)),
+    ]
+    partial = _mix_down_kernel(
+        inputs=[x, message, down],
+        template=tmpl,
+        grid=(_MIX_SPLITS * _MIX_TG, rows, n),
+        threadgroup=(_MIX_TG, 1, 1),
+        output_shapes=[(n, rows, _MIX_SPLITS, rank)],
+        output_dtypes=[mx.float32],
+    )[0]
+    tg = _MIX_TG
+    return _mix_gate_kernel(
+        inputs=[partial, x, message, gain_forget],
+        template=tmpl,
+        grid=(((hidden + tg - 1) // tg) * tg, rows, n),
+        threadgroup=(tg, 1, 1),
+        output_shapes=[x.shape],
+        output_dtypes=[mx.float32],
+    )[0]
