@@ -398,6 +398,8 @@ def banded_sink_attention(
     b, length = q.shape[0], q.shape[2]
     if b == 1 and length == 1 and left_padding is None:
         return _decode_attention(q, k, v, rel, sink, scale, window)
+    if verify_attention_fits(q, k, left_padding):
+        return verify_attention(q, k, v, rel, sink, scale=scale, window=window)
     if q.dtype == mx.bfloat16 and _use_flash(length, window):
         return flash_banded_attention(
             q, k, v, rel, sink, scale=scale, window=window, left_padding=left_padding
@@ -702,3 +704,289 @@ def mix_messages_small(x, message, down, gain_forget, first: int):
         output_shapes=[x.shape],
         output_dtypes=[mx.float32],
     )[0]
+
+
+# Depthwise causal conv with a residual (``model._static_conv``) for decode and
+# verify rows: one kernel instead of a concatenate, the tap sum and the casts.
+_SCONV_SOURCE = """
+    const uint c = thread_position_in_grid.x;
+    const uint t = thread_position_in_grid.y;
+    const uint b = thread_position_in_grid.z;
+    const uint C = threads_per_grid.x;
+    const uint L = threads_per_grid.y;
+    const size_t xb = (size_t)b * L * C;
+    const size_t sb = (size_t)b * (K - 1) * C;
+    const size_t pb = (size_t)b * (K - 1 + L) * C;
+    // Padded window row r: the state for r < K - 1, then the inputs.
+    float acc = 0.0f;
+    for (uint j = 0; j < K; ++j) {
+        const uint r = t + j;
+        const float v = r < K - 1 ? state[sb + (size_t)r * C + c]
+                                  : float(x[xb + (size_t)(r - (K - 1)) * C + c]);
+        const float term = float(w[c * K + j]) * v;
+        acc = j == 0 ? term : acc + term;
+    }
+    const float xf = float(x[xb + (size_t)t * C + c]);
+    const float rounded = float(static_cast<WT>(acc));
+    out[xb + (size_t)t * C + c] = static_cast<T>((rounded + xf) * scale[0]);
+    xp[pb + (size_t)(K - 1 + t) * C + c] = xf;
+    for (uint r = t; r < K - 1; r += L) {
+        xp[pb + (size_t)r * C + c] = state[sb + (size_t)r * C + c];
+    }
+"""
+_sconv_kernel = None
+
+
+def static_conv_small(x, w, state, scale: float):
+    """``model._static_conv`` for a few rows; same arguments and results."""
+    global _sconv_kernel
+    if _sconv_kernel is None:
+        _sconv_kernel = mx.fast.metal_kernel(
+            name="omlx_inkling2_static_conv",
+            input_names=["x", "w", "state", "scale"],
+            output_names=["out", "xp"],
+            source=_SCONV_SOURCE,
+        )
+    b, length, c = x.shape
+    k = w.shape[-1]
+    out, xp = _sconv_kernel(
+        inputs=[x, w, state.astype(mx.float32), mx.array([scale], mx.float32)],
+        template=[("T", x.dtype), ("WT", w.dtype), ("K", k)],
+        grid=(c, length, b),
+        threadgroup=(min(256, c), 1, 1),
+        output_shapes=[(b, length, c), (b, k - 1 + length, c)],
+        output_dtypes=[x.dtype, mx.float32],
+    )
+    return out, xp
+
+
+# Attention for speculative verify blocks (2..16 queries, one row): split-K
+# over the visible keys, reading K/V in place. The general masked path
+# instead builds the bias mask with a dozen small ops and concatenates a zero
+# key row (the sink) onto the K/V history, which copies the whole cache of a
+# full-attention layer on every verify.
+_VERIFY_BK = 32
+_VERIFY_MAX_QUERIES = 16
+_VERIFY_MAX_SPLITS = 64
+
+_VERIFY_PARTIAL_SOURCE = """
+    constexpr int BK = 32;
+    constexpr int NSG = 4;
+    constexpr int G = HQ / HKV;
+    constexpr int ROWS = G * L;
+    constexpr int RPS = (ROWS + NSG - 1) / NSG;
+    constexpr int LDK = D + 4;
+    constexpr int DPL = D / 32;
+    const int tid = thread_position_in_threadgroup.x;
+    const int lane = tid % 32;
+    const int sg = tid / 32;
+    const int split = threadgroup_position_in_grid.x;
+    const int hk = threadgroup_position_in_grid.y;
+    const int S = dims[0];
+    const int k_lo = dims[1];
+    const int chunk = dims[2];
+    const int c0 = k_lo + split * chunk;
+    const int c1 = min(S, c0 + chunk);
+    const float sc = scale[0];
+
+    threadgroup bfloat Qs[ROWS * D];
+    threadgroup bfloat Ks[BK * LDK];
+    threadgroup bfloat Vs[BK * D];
+    for (int i = tid; i < ROWS * D; i += NSG * 32) {
+        const int r = i / D;
+        const int col = i % D;
+        const int h = hk * G + r / L;
+        const int qi = r % L;
+        Qs[i] = q[((size_t)h * L + qi) * D + col];
+    }
+
+    float m[RPS], l[RPS], o[RPS][DPL];
+    for (int i = 0; i < RPS; ++i) {
+        m[i] = -INFINITY;
+        l[i] = 0.0f;
+        for (int e = 0; e < DPL; ++e) o[i][e] = 0.0f;
+    }
+    const device T* kb = k + hk * k_strides[1];
+    const device T* vb = v + hk * v_strides[1];
+    const bool vec_kv = k_strides[3] == 1 && v_strides[3] == 1
+        && k_strides[2] % 4 == 0 && v_strides[2] % 4 == 0;
+
+    for (int t0 = c0; t0 < c1; t0 += BK) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (vec_kv) {
+            for (int i = tid; i < BK * D / 4; i += NSG * 32) {
+                const int r = i / (D / 4);
+                const int col = (i % (D / 4)) * 4;
+                const int key = t0 + r;
+                bfloat4 kv = bfloat4(bfloat(0.0f)), vv = bfloat4(bfloat(0.0f));
+                if (key < c1) {
+                    kv = *(const device bfloat4*)(kb + key * k_strides[2] + col);
+                    vv = *(const device bfloat4*)(vb + key * v_strides[2] + col);
+                }
+                *(threadgroup bfloat4*)(Ks + r * LDK + col) = kv;
+                *(threadgroup bfloat4*)(Vs + r * D + col) = vv;
+            }
+        } else {
+            for (int i = tid; i < BK * D; i += NSG * 32) {
+                const int r = i / D;
+                const int col = i % D;
+                const int key = t0 + r;
+                bfloat kv = bfloat(0.0f), vv = bfloat(0.0f);
+                if (key < c1) {
+                    kv = kb[key * k_strides[2] + col * k_strides[3]];
+                    vv = vb[key * v_strides[2] + col * v_strides[3]];
+                }
+                Ks[r * LDK + col] = kv;
+                Vs[r * D + col] = vv;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        const int key = t0 + lane;
+        for (int i = 0; i < RPS; ++i) {
+            const int r = sg + i * NSG;
+            if (r >= ROWS) break;
+            const int h = hk * G + r / L;
+            const int qi = r % L;
+            const int d = (S - L + qi) - key;
+            const bool vis = key < c1 && d >= 0 && (WINDOW == 0 || d < WINDOW);
+            float s = -INFINITY;
+            if (vis) {
+                float acc = 0.0f;
+                const threadgroup bfloat4* qv = (const threadgroup bfloat4*)(Qs + r * D);
+                const threadgroup bfloat4* kv4 = (const threadgroup bfloat4*)(Ks + lane * LDK);
+                for (int c = 0; c < D / 4; ++c) {
+                    acc += dot(float4(qv[c]), float4(kv4[c]));
+                }
+                s = acc * sc;
+                if (d < R) s += float(rel[((size_t)qi * HQ + h) * R + d]);
+            }
+            const float tmax = simd_max(s);
+            if (tmax == -INFINITY) continue;
+            const float m_new = max(m[i], tmax);
+            const float factor = metal::exp(m[i] - m_new);
+            const float p = vis ? metal::exp(s - m_new) : 0.0f;
+            l[i] = l[i] * factor + simd_sum(p);
+            m[i] = m_new;
+            float4 oi = float4(o[i][0], o[i][1], o[i][2], o[i][3]) * factor;
+            for (int kk = 0; kk < BK; ++kk) {
+                const float pk = simd_shuffle(p, kk);
+                oi += pk * float4(*(const threadgroup bfloat4*)(Vs + kk * D + lane * 4));
+            }
+            o[i][0] = oi[0]; o[i][1] = oi[1]; o[i][2] = oi[2]; o[i][3] = oi[3];
+        }
+    }
+    for (int i = 0; i < RPS; ++i) {
+        const int r = sg + i * NSG;
+        if (r >= ROWS) break;
+        const int h = hk * G + r / L;
+        const int qi = r % L;
+        const size_t row = ((size_t)split * HQ + h) * L + qi;
+        if (lane == 0) {
+            pm[row] = m[i];
+            pl[row] = l[i];
+        }
+        for (int e = 0; e < DPL; ++e) po[row * D + lane * DPL + e] = o[i][e];
+    }
+"""
+
+_VERIFY_COMBINE_SOURCE = """
+    const int c = thread_position_in_grid.x;
+    const int qi = thread_position_in_grid.y;
+    const int h = thread_position_in_grid.z;
+    const int nspl = dims[0];
+    const float sk = float(sink[(size_t)qi * HQ + h]);
+    float mx_ = sk;
+    for (int s = 0; s < nspl; ++s) {
+        mx_ = max(mx_, pm[((size_t)s * HQ + h) * L + qi]);
+    }
+    float total = metal::exp(sk - mx_);
+    float acc = 0.0f;
+    for (int s = 0; s < nspl; ++s) {
+        const size_t row = ((size_t)s * HQ + h) * L + qi;
+        const float ms = pm[row];
+        if (ms == -INFINITY) continue;
+        const float w = metal::exp(ms - mx_);
+        total += pl[row] * w;
+        acc += po[row * D + c] * w;
+    }
+    out[((size_t)qi * HQ + h) * D + c] = static_cast<T>(acc / total);
+"""
+_verify_kernels = None
+
+
+def verify_attention_fits(q, k, left_padding) -> bool:
+    b, hq, length, d = q.shape
+    return (
+        b == 1
+        and 2 <= length <= _VERIFY_MAX_QUERIES
+        and left_padding is None
+        and q.dtype == mx.bfloat16
+        and k.dtype == mx.bfloat16
+        and d == 128
+        and hq % k.shape[1] == 0
+        and mx.default_device() == mx.gpu
+    )
+
+
+def verify_attention(q, k, v, rel, sink, *, scale, window):
+    """``banded_sink_attention`` for one row of 2..16 queries."""
+    global _verify_kernels
+    if _verify_kernels is None:
+        _verify_kernels = (
+            mx.fast.metal_kernel(
+                name="omlx_inkling2_verify_attn_partial",
+                input_names=["q", "k", "v", "rel", "dims", "scale"],
+                output_names=["po", "pm", "pl"],
+                source=_VERIFY_PARTIAL_SOURCE,
+                ensure_row_contiguous=False,
+            ),
+            mx.fast.metal_kernel(
+                name="omlx_inkling2_verify_attn_combine",
+                input_names=["po", "pm", "pl", "sink", "dims"],
+                output_names=["out"],
+                source=_VERIFY_COMBINE_SOURCE,
+            ),
+        )
+    partial_k, combine_k = _verify_kernels
+    _, hq, length, d = q.shape
+    hkv, s = k.shape[1], k.shape[2]
+    r = rel.shape[-1]
+    k_lo = max(0, s - length - window + 1) if window else 0
+    span = s - k_lo
+    nspl = max(1, min(_VERIFY_MAX_SPLITS, -(-span // (2 * _VERIFY_BK))))
+    chunk = -(-span // nspl)
+    chunk = -(-chunk // _VERIFY_BK) * _VERIFY_BK
+    nspl = -(-span // chunk)
+    tmpl = [
+        ("T", q.dtype),
+        ("D", d),
+        ("HQ", hq),
+        ("HKV", hkv),
+        ("L", length),
+        ("R", r),
+        ("WINDOW", int(window)),
+    ]
+    po, pm, pl = partial_k(
+        inputs=[
+            mx.contiguous(q),
+            k,
+            v,
+            mx.contiguous(rel),
+            mx.array([s, k_lo, chunk], dtype=mx.int32),
+            mx.array([scale], dtype=mx.float32),
+        ],
+        template=tmpl,
+        grid=(nspl * 128, hkv, 1),
+        threadgroup=(128, 1, 1),
+        output_shapes=[(nspl, hq, length, d), (nspl, hq, length), (nspl, hq, length)],
+        output_dtypes=[mx.float32, mx.float32, mx.float32],
+    )
+    out = combine_k(
+        inputs=[po, pm, pl, mx.contiguous(sink), mx.array([nspl], dtype=mx.int32)],
+        template=[("T", q.dtype), ("D", d), ("HQ", hq), ("L", length)],
+        grid=(d, length, hq),
+        threadgroup=(d, 1, 1),
+        output_shapes=[(1, length, hq, d)],
+        output_dtypes=[q.dtype],
+    )[0]
+    return out.transpose(0, 2, 1, 3)
