@@ -204,6 +204,7 @@ _ROTATING_CACHE_TYPES = (
     "RotatingKVCache",
     "BatchRotatingKVCache",
     "BufferedRotatingKVCache",
+    "Inkling2WindowKVCache",
 )
 
 _STORAGE_CLASS_NAME_ALIASES = {
@@ -274,6 +275,9 @@ def _canonicalize_layer_cache_types(
     wrapper_to_canonical = {
         "SizedArraysCache": "ArraysCache",
         "PrefillReadyRotatingKVCache": "RotatingKVCache",
+        # Inkling 2 sliding layers persist a temporal window and restore as
+        # a rotating cache, which the model adopts before reading it.
+        "Inkling2WindowKVCache": "RotatingKVCache",
         POOLING_CACHE_DELTA_CLASS: "PoolingCache",
         # Batch and single-request TurboQuant caches persist the same packed
         # per-request state (the save path records whichever class name it
@@ -539,6 +543,8 @@ _CACHELIST_NON_SLICEABLE_SUB_CLASSES = frozenset(
         "BatchRotatingKVCache",
         "PrefillReadyRotatingKVCache",
         "BufferedRotatingKVCache",
+        "Inkling2WindowKVCache",
+        "Inkling2BatchWindowKVCache",
     }
 )
 

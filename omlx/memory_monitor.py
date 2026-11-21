@@ -1912,6 +1912,8 @@ _ROTATING_CACHE_CLASS_NAMES = frozenset(
         "BatchRotatingKVCache",
         "PrefillReadyRotatingKVCache",
         "BufferedRotatingKVCache",
+        "Inkling2WindowKVCache",
+        "Inkling2BatchWindowKVCache",
     }
 )
 # Fixed-state recurrent caches (GDN/Mamba). Matches

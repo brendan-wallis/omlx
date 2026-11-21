@@ -27,6 +27,8 @@ import mlx.nn as nn
 from mlx_lm.models.base import BaseModelArgs
 from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
 
+from .cache import Inkling2WindowKVCache, adopt
+
 from . import kernels
 from .loader import sanitize_weights
 from .vision import VisionArgs, VisionTower
@@ -565,6 +567,10 @@ def _cumsum(xs):
 # every new chunk length would otherwise retrace all layers.
 _COMPILED_MAX_TOKENS = 16
 
+# Sliding layers store only their window (plus rollback slack). False keeps
+# the full history on every layer, as before.
+BOUNDED_SLIDING_KV = True
+
 
 class Inkling2Layer(nn.Module):
     def __init__(self, args: TextArgs, layer_idx: int, w13_spec: dict, w2_spec: dict):
@@ -727,6 +733,12 @@ class Inkling2TextModel(nn.Module):
                 f"Inkling 2 needs one cache entry per layer visit "
                 f"({self.num_visits}), got {len(cache)}"
             )
+        else:
+            for (idx, _), c in zip(self._schedule, cache):
+                # Restored or merged sliding entries arrive as stock rotating
+                # caches, which keep decode keys in ring order.
+                if self.layers[idx].sliding and c is not None:
+                    adopt(c)
         blocks: list = []
         prelude = bank = None
         for visit, ((idx, loop_pass), c) in enumerate(zip(self._schedule, cache)):
@@ -899,9 +911,16 @@ class Model(nn.Module):
     def make_cache(self):
         # One entry per layer visit: each loop pass keeps its own KV and conv
         # states.
-        return [
-            CacheList(KVCache(), ArraysCache(4)) for _ in range(self.model.num_visits)
-        ]
+        text = self.model
+        window = self.args.text.sliding_window_size
+        caches = []
+        for idx, _ in text._schedule[: text.num_visits]:
+            if BOUNDED_SLIDING_KV and text.layers[idx].sliding:
+                kv = Inkling2WindowKVCache(window)
+            else:
+                kv = KVCache()
+            caches.append(CacheList(kv, ArraysCache(4)))
+        return caches
 
     def sanitize(self, weights: dict) -> dict:
         out, formats = sanitize_weights(self, weights)

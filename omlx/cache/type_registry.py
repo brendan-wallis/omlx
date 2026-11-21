@@ -62,6 +62,11 @@ class CacheTypeRegistry:
         # otherwise the default handler reconstructs vanilla
         # RotatingKVCache and the size() override is lost.
         "PrefillReadyRotatingKVCache": CacheType.ROTATING_KVCACHE,
+        # Inkling 2 sliding-window layers (omlx/patches/inkling2/cache.py):
+        # a temporal-order window with rollback slack. The single-request
+        # state is rotating-compatible; the batch form is only live.
+        "Inkling2WindowKVCache": CacheType.ROTATING_KVCACHE,
+        "Inkling2BatchWindowKVCache": CacheType.BATCH_ROTATING_KVCACHE,
         "BatchKVCache": CacheType.BATCH_KVCACHE,
         "BatchRotatingKVCache": CacheType.BATCH_ROTATING_KVCACHE,
         "ArraysCache": CacheType.ARRAYS_CACHE,

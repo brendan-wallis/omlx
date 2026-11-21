@@ -3352,6 +3352,16 @@ class Scheduler:
                 return True
         return False
 
+    def _is_inkling2_bounded_window(self) -> bool:
+        """Inkling 2 with window-bounded sliding-layer KV."""
+        for target in (self.model, getattr(self.model, "language_model", None)):
+            if target is None:
+                continue
+            mt = str(getattr(target, "model_type", "") or "")
+            if mt in ("inkling2", "inkling2_loop"):
+                return True
+        return False
+
     def _align_block_size_with_rotating_window(self) -> None:
         """
         Align paged cache block size to a multiple of RotatingKVCache
@@ -3401,6 +3411,16 @@ class Scheduler:
             floor = int(getattr(self, "_qwen35_prefill_floor", 0) or 0)
             if floor > hi and floor % window_size == 0:
                 lo = hi = floor
+        elif self._is_inkling2_bounded_window():
+            # Inkling 2 sliding layers store only their window, but the
+            # layers' conv states still take a boundary snapshot per block.
+            # Keep the 2048-token prefill chunks (and block size) the
+            # full-history layout had, rounded to a multiple of the window.
+            target = max(
+                self._ARRAYS_CACHE_BLOCK_SIZE,
+                int(self.config.prefill_step_size or 0),
+            )
+            lo = hi = -(-target // window_size) * window_size
 
         if window_size >= hi or window_size >= lo:
             target_block_size = window_size
@@ -4144,6 +4164,8 @@ class Scheduler:
                 "BatchRotatingKVCache",
                 "PrefillReadyRotatingKVCache",
                 "BufferedRotatingKVCache",
+                "Inkling2WindowKVCache",
+                "Inkling2BatchWindowKVCache",
                 "TurboQuantKVCache",
                 "BatchTurboQuantKVCache",
                 "Affine4KVCache",
@@ -10739,6 +10761,7 @@ class Scheduler:
                                     "RotatingKVCache",
                                     "BatchRotatingKVCache",
                                     "PrefillReadyRotatingKVCache",
+                                    "Inkling2WindowKVCache",
                                 ):
                                     normalized_state, normalized_meta = (
                                         self._normalize_rotating_snapshot_state(
@@ -10819,6 +10842,7 @@ class Scheduler:
                         "BatchRotatingKVCache",
                         "PrefillReadyRotatingKVCache",
                         "BufferedRotatingKVCache",
+                        "Inkling2WindowKVCache",
                     )
                     if HAS_CACHE_TYPE_HANDLERS and CacheTypeRegistry is not None:
                         is_rotating_cache = (
